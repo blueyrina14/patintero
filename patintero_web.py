@@ -512,8 +512,10 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
 #pad{display:none;position:relative;flex:none;width:var(--padsz);height:var(--padsz);border-radius:50%;background:rgba(23,59,114,.28);border:3px solid rgba(255,255,255,.75)}
 #pad i{position:absolute;font-style:normal;color:#fff;font-size:calc(var(--padsz)*.15);transform:translate(-50%,-50%);pointer-events:none}
 #knob{position:absolute;left:50%;top:50%;width:36%;height:36%;margin:-18% 0 0 -18%;border-radius:50%;background:#fff;opacity:.9;pointer-events:none}
-@media (pointer:coarse){:root{--padsz:min(34vmin,220px)} #pad{display:block}}
-@media (orientation:portrait){#app{flex-direction:column;justify-content:flex-start;padding-top:2vh} #stage{width:100vw} :root{--padsz:min(46vw,260px)}}
+@media (pointer:coarse){:root{--padsz:min(18vmin,100px)} #pad{display:block}}
+@media (orientation:portrait){#app{flex-direction:column;justify-content:flex-start;padding-top:1vh;gap:1.2vh}
+  :root{--padsz:min(20vw,100px)}
+  #stage{width:min(100vw,calc((100dvh - var(--padsz) - 6vh)*1000/720))}}
 </style></head>
 <body>
 <div id="app">
@@ -813,11 +815,11 @@ function connect(q){
 }
 function createGame(mode){connect('create=1&mode='+mode);}
 function joinGame(){const c=($('code').value||'').trim().toUpperCase();if(c.length!==4){setStatus('Enter the 4-letter code');return;}connect('room='+encodeURIComponent(c));}
-function toMenu(msg){const s=ws;ws=null;if(s)try{s.close();}catch(e){}offline=false;localSim=null;me=0;pad.style.display='';
+function toMenu(msg){const s=ws;ws=null;if(s)try{s.close();}catch(e){}offline=false;localSim=null;me=0;pad.style.display='none';
   view='menu';st=null;disp=null;popups=[];$('leave').style.display='none';menuUI(msg);}
 function onMsg(m){
   clearTimeout(connectTimer);
-  if(m.t==='welcome'){me=m.id;room=m.room;lan=m.lan||'';lanAll=m.lanAll||(lan?[lan]:[]);view='game';st=null;disp=null;popups=[];myChoice=null;setUI('');$('leave').style.display='block';}
+  if(m.t==='welcome'){me=m.id;room=m.room;lan=m.lan||'';lanAll=m.lanAll||(lan?[lan]:[]);view='game';st=null;disp=null;popups=[];myChoice=null;setUI('');$('leave').style.display='block';pad.style.display='';}
   else if(m.t==='error'){gotError=true;const s=ws;ws=null;if(s)try{s.close();}catch(e){}setStatus(m.msg);}
   else if(m.t==='s')applyState(m);
 }
@@ -840,6 +842,7 @@ function applyState(m){
 /* ---------- DOM screens ---------- */
 function setUI(h){ui.innerHTML=h;ui.style.display=h?'flex':'none';}
 function menuUI(msg){
+  pad.style.display='none';
   const pre=(new URLSearchParams(location.search).get('room')||'').replace(/[^A-Za-z]/g,'').slice(0,4);
   setUI('<div class="card"><h1>PATINTERO</h1><div class="sub">Takbo \u2022 Iwas \u2022 Pumasa</div>'+
    '<div class="or">create a game</div>'+
