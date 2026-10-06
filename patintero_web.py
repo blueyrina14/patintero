@@ -652,10 +652,10 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
 #pad{display:none;position:relative;flex:none;width:var(--padsz);height:var(--padsz);border-radius:50%;background:rgba(23,59,114,.28);border:3px solid rgba(255,255,255,.75)}
 #pad i{position:absolute;font-style:normal;color:#fff;font-size:calc(var(--padsz)*.15);transform:translate(-50%,-50%);pointer-events:none}
 #knob{position:absolute;left:50%;top:50%;width:36%;height:36%;margin:-18% 0 0 -18%;border-radius:50%;background:#fff;opacity:.9;pointer-events:none}
-@media (pointer:coarse),(hover:none){:root{--padsz:min(18vmin,100px)} #pad{display:block}}
-@media (pointer:coarse) and (min-width:600px),(hover:none) and (min-width:600px){:root{--padsz:min(14vmin,150px)}}
+@media (pointer:coarse),(hover:none){:root{--padsz:min(21vmin,125px)} #pad{display:block}}
+@media (pointer:coarse) and (min-width:600px),(hover:none) and (min-width:600px){:root{--padsz:min(16vmin,175px)}}
 @media (orientation:portrait){#app{flex-direction:column;justify-content:flex-start;padding-top:1vh;gap:1.2vh}
-  :root{--padsz:min(20vw,100px)}
+  :root{--padsz:min(24vw,125px)}
   #stage{width:min(100vw,calc((100dvh - var(--padsz) - 6vh)*1000/720))}}
 </style></head>
 <body>
