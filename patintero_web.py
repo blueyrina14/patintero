@@ -106,48 +106,139 @@ class Conn:
 # GAME ROOM (server-authoritative)
 # ============================================================
 
+GUARD_TAG_BONUS = 10            # versus: points the guard team earns per tag (not just round-ending)
+
+
 class Room:
+    """No player limit: anyone can join the lobby. The host (first to join, or whoever's
+    oldest still connected) taps Start when ready. VERSUS splits an arbitrary group into two
+    teams by pairing everyone up and having each pair really play Jack en poy (reusing the
+    same hidden-choice + shake + reveal flow as a 2-player game, one pair at a time, in front
+    of everyone); winners become Team 1 (runs first), losers Team 2, and a lone leftover player
+    (odd headcount) is auto-placed on whichever team ends up smaller. Each round every member of
+    the running team runs at once (tag = respawn & keep trying, like co-op); every member of the
+    guarding team gets their own guard, spread across the patrol lines."""
+
     def __init__(self, code, mode="coop"):
         self.code = code
         self.mode = mode                 # "coop" or "versus"
-        self.conns = [None, None]
-        self.first = 0                   # who RUNS in round 1 (the Jack en poy winner)
-        self.rr = 0                      # bumps whenever the RPS screen must reset
+        self.conns = {}                  # pid -> conn (pid is stable for the room's lifetime)
+        self.order = []                  # join order; order[0] still connected = the host
+        self.next_pid = 0
         self.alive = True
-        self.reset()
+        self.input = {}                  # pid -> {"dx":, "dy":}, persists across rounds/roles
+        self.byes = []
+        self.reset_match()
+
+    # ---------- roster ----------
+    def roster(self):
+        return [pid for pid in self.order if pid in self.conns]
+
+    def host(self):
+        r = self.roster()
+        return r[0] if r else None
+
+    def join(self, conn):
+        pid = self.next_pid
+        self.next_pid += 1
+        self.conns[pid] = conn
+        self.order.append(pid)
+        return pid
+
+    def leave(self, conn):
+        pid = next((k for k, v in self.conns.items() if v is conn), None)
+        if pid is None:
+            return
+        del self.conns[pid]
+        if not self.conns:
+            self.alive = False
+            ROOMS.pop(self.code, None)
+        # mid-match: everyone else keeps playing; the departed player's token just stops moving
 
     # ---------- state ----------
-    def reset(self):
-        if not all(self.conns):
-            self.phase, self.timer = "lobby", RPS_TIME
-        elif self.mode == "versus":              # Jack en poy decides the teams
-            self.phase, self.timer = "rps", RPS_TIME
-        else:                                    # co-op: no teams, straight to the game
-            self.phase, self.timer = "ready", READY_TIME
-        self.rr += 1
-        self.choices = [None, None]
-        self.rc, self.rw = None, -1
+    def reset_match(self):
+        """Back to the lobby so the (possibly changed) group of people can start a new match."""
+        self.phase, self.timer = "lobby", 0
+        self.team, self.pairs, self.pair_idx = {}, [], 0
+        self.pair_choices, self.pair_rc, self.pair_rw = {}, None, -1
+        self.byes = []
+        self.runner_team = 0
+        self.round = 1
+        self.round_timer = 0
         self.rs = [0, 0]
         self.score = 0
-        self.round = 1
         self.msg = ""
-        self.again = set()
         self.events = []
-        self.setup_round()
+        self.players, self.guards, self.guard_of = {}, [], {}
 
-    def setup_round(self):
-        self.runner = (self.first + self.round - 1) % 2
-        self.round_timer = ROUND_TIME
-        self.guards = [
-            {"x": 350, "y": LINE_1, "dx": GUARD_SPEED, "moving": True},
-            {"x": MIDDLE_X, "y": 300, "dx": 0, "moving": False},
-        ]
-        if self.mode == "versus":                # bottom guard is played by a human
-            self.guards.append({"x": MIDDLE_X, "y": LINE_2, "dx": 0, "moving": False})
-        else:                                    # co-op: an AI guard
-            self.guards.append({"x": 650, "y": LINE_2, "dx": -GUARD_SPEED, "moving": True})
-        self.players = [{"x": START_X[i], "y": START_Y, "dx": 0, "dy": 0, "crossed": [False, False],
-                         "pts": 0, "done": False, "hurt": 0.0} for i in (0, 1)]
+    def start(self, pid):
+        """Only the host, only from the lobby, and only with at least 2 people."""
+        if pid != self.host() or self.phase != "lobby" or len(self.roster()) < 2:
+            return
+        if self.mode == "versus":
+            self.begin_pairing()
+        else:
+            self.setup_round_coop()
+            self.phase, self.timer = "ready", READY_TIME
+
+    def on_message(self, pid, m):
+        t = m.get("t")
+        if t == "in":
+            dx = max(-1, min(1, int(m.get("dx", 0))))
+            dy = max(-1, min(1, int(m.get("dy", 0))))
+            self.input[pid] = {"dx": dx, "dy": dy}
+        elif t == "start":
+            self.start(pid)
+        elif t == "rps" and self.phase == "rps":
+            a, b = self.pairs[self.pair_idx]
+            if pid in (a, b) and pid not in self.pair_choices:
+                c = int(m.get("c", -1))
+                if c in (0, 1, 2):
+                    self.pair_choices[pid] = c
+        elif t == "again" and pid == self.host() and self.phase == "done":
+            self.reset_match()
+
+    # ---------- versus: pair everyone up, Jack en poy each pair in turn ----------
+    def begin_pairing(self):
+        people = list(self.roster())
+        random.shuffle(people)
+        self.pairs = [people[i:i + 2] for i in range(0, len(people), 2)]
+        for pair in self.pairs:
+            if len(pair) == 1:
+                pair.append(None)
+        self.pair_idx, self.team, self.byes = 0, {}, []
+        self.start_pair()
+
+    def start_pair(self):
+        self.pair_choices, self.pair_rc, self.pair_rw = {}, None, -1
+        a, b = self.pairs[self.pair_idx]
+        if b is None:                                       # odd one out: settled once sizes are known
+            self.byes.append(a)
+            self.pair_idx += 1
+            if self.pair_idx >= len(self.pairs):
+                self.settle_teams()
+            else:
+                self.start_pair()
+            return
+        self.phase, self.timer = "rps", RPS_TIME
+
+    def finish_pair(self, win_pid, lose_pid):
+        self.team[win_pid] = 0
+        self.team[lose_pid] = 1
+        self.pair_idx += 1
+        if self.pair_idx >= len(self.pairs):
+            self.settle_teams()
+        else:
+            self.start_pair()
+
+    def settle_teams(self):
+        for pid in self.byes:                                # balance: bye goes to the smaller team
+            t0 = sum(1 for v in self.team.values() if v == 0)
+            t1 = sum(1 for v in self.team.values() if v == 1)
+            self.team[pid] = 0 if t0 <= t1 else 1
+        self.runner_team, self.round = 0, 1
+        self.setup_round_versus()
+        self.phase, self.timer = "ready", READY_TIME
 
     def revealed(self):
         """True once the outcome is allowed to reach the browser: not before the
@@ -157,51 +248,80 @@ class Room:
     def snapshot(self):
         return {
             "t": "s", "ph": self.phase, "tm": round(max(0, self.timer), 2),
-            "on": [c is not None for c in self.conns],
-            "mode": self.mode, "sc": self.score,
-            "rn": self.runner, "rd": self.round, "tot": ROUNDS,
-            "rt": round(max(0, self.round_timer), 1), "rs": self.rs, "msg": self.msg,
-            "rr": self.rr, "ch": [c is not None for c in self.choices],
-            "rc": self.rc if self.revealed() else None, "rw": self.rw if self.revealed() else -1,
-            "g": [[round(g["x"], 1), g["y"], int(g["moving"])] for g in self.guards],
-            "p": [[round(p["x"], 1), round(p["y"], 1), int(p["done"]), round(p["hurt"], 2)]
-                  for p in self.players],
+            "mode": self.mode, "roster": self.roster(), "host": self.host(),
+            "sc": self.score, "rd": self.round, "tot": ROUNDS,
+            "rt": round(max(0, self.round_timer), 1) if self.mode == "versus" else 0,
+            "rs": self.rs, "msg": self.msg, "runnerTeam": self.runner_team, "team": self.team,
+            "pair": self.pairs[self.pair_idx] if self.pairs and self.pair_idx < len(self.pairs) else None,
+            "pairNum": self.pair_idx + 1 if self.pairs else 0, "pairTotal": len(self.pairs),
+            "ch": self._pair_choice_flags(),
+            "rc": self.pair_rc if self.revealed() else None, "rw": self.pair_rw if self.revealed() else -1,
+            "g": [[round(g["x"], 1), g["y"], int(g["moving"]), self._guard_owner(i)]
+                  for i, g in enumerate(self.guards)],
+            "p": {str(pid): [round(p["x"], 1), round(p["y"], 1), int(p["done"]), round(p["hurt"], 2)]
+                  for pid, p in self.players.items()},
             "ev": self.events,
         }
 
-    # ---------- players coming and going ----------
-    def join(self, conn):
-        for i in (0, 1):
-            if self.conns[i] is None:
-                self.conns[i] = conn
-                if all(self.conns):
-                    self.reset()                      # both here -> Jack en poy
-                return i
+    def _pair_choice_flags(self):
+        if not self.pairs or self.pair_idx >= len(self.pairs):
+            return [False, False]
+        a, b = self.pairs[self.pair_idx]
+        return [a in self.pair_choices, True if b is None else b in self.pair_choices]
+
+    def _guard_owner(self, gi):
+        for pid, i in self.guard_of.items():
+            if i == gi:
+                return pid
         return None
 
-    def leave(self, conn):
-        if conn in self.conns:
-            self.conns[self.conns.index(conn)] = None
-            if not any(self.conns):
-                self.alive = False
-                ROOMS.pop(self.code, None)
-            else:
-                self.reset()                          # back to the lobby
+    # ---------- round setup ----------
+    def setup_round_coop(self):
+        self.guards = [
+            {"x": 350, "y": LINE_1, "dx": GUARD_SPEED, "moving": True},
+            {"x": MIDDLE_X, "y": 300, "dx": 0, "moving": False},
+            {"x": 650, "y": LINE_2, "dx": -GUARD_SPEED, "moving": True},
+        ]
+        self.guard_of = {}
+        self.players = {}
+        roster = self.roster()
+        n = max(1, len(roster))
+        span = COURT_RIGHT - COURT_LEFT - 80
+        for i, pid in enumerate(roster):
+            x = COURT_LEFT + 40 + (span * (i + 1) / (n + 1) if n > 1 else span / 2)
+            self.players[pid] = {"x": x, "y": START_Y, "dx": 0, "dy": 0, "crossed": [False, False],
+                                 "pts": 0, "done": False, "hurt": 0.0, "start_x": x}
 
-    def on_message(self, pid, m):
-        t = m.get("t")
-        if t == "in":
-            p = self.players[pid]
-            p["dx"] = max(-1, min(1, int(m.get("dx", 0))))
-            p["dy"] = max(-1, min(1, int(m.get("dy", 0))))
-        elif t == "rps" and self.phase == "rps" and self.choices[pid] is None:
-            c = int(m.get("c", -1))
-            if c in (0, 1, 2):
-                self.choices[pid] = c
-        elif t == "again" and self.phase == "done":
-            self.again.add(pid)
-            if len(self.again) == 2:
-                self.reset()
+    def setup_round_versus(self):
+        runners = [pid for pid in self.roster() if self.team.get(pid) == self.runner_team]
+        guard_people = [pid for pid in self.roster() if self.team.get(pid) == 1 - self.runner_team]
+
+        self.players = {}
+        n = max(1, len(runners))
+        span = COURT_RIGHT - COURT_LEFT - 80
+        for i, pid in enumerate(runners):
+            x = COURT_LEFT + 40 + (span * (i + 1) / (n + 1) if n > 1 else span / 2)
+            self.players[pid] = {"x": x, "y": START_Y, "dx": 0, "dy": 0, "crossed": [False, False],
+                                 "pts": 0, "done": False, "hurt": 0.0, "start_x": x}
+
+        line_defaults = [                                     # top / middle / bottom patrol lines
+            {"y": LINE_1, "x": 350, "dx": GUARD_SPEED, "moving": True},
+            {"y": 300, "x": MIDDLE_X, "dx": 0, "moving": False},
+            {"y": LINE_2, "x": 650, "dx": -GUARD_SPEED, "moving": True},
+        ]
+        self.guards, self.guard_of = [], {}
+        for li, default in enumerate(line_defaults):
+            assigned = [pid for i, pid in enumerate(guard_people) if i % 3 == li]
+            if assigned:                                      # humans on this line replace its AI
+                m = len(assigned)
+                for k, pid in enumerate(assigned):
+                    x = (MIDDLE_X if m == 1 else
+                         COURT_LEFT + 60 + (COURT_RIGHT - COURT_LEFT - 120) * k / (m - 1))
+                    self.guard_of[pid] = len(self.guards)
+                    self.guards.append({"x": x, "y": default["y"], "dx": 0, "moving": False})
+            else:                                              # nobody here: an AI patrols it instead
+                self.guards.append(dict(default))
+        self.round_timer = ROUND_TIME
 
     # ---------- simulation ----------
     def step(self, dt):
@@ -216,12 +336,15 @@ class Room:
         ph = self.phase
         if ph == "rps":
             self.timer -= dt
+            a, b = self.pairs[self.pair_idx]
             if self.timer <= 0:                                   # too slow: random pick
-                self.choices = [c if c is not None else random.randrange(3) for c in self.choices]
-            if None not in self.choices:
-                a, b = self.choices
-                self.rw = 0 if (a - b) % 3 == 1 else 1 if (b - a) % 3 == 1 else -1
-                self.rc = list(self.choices)
+                for pid in (a, b):
+                    if pid is not None and pid not in self.pair_choices:
+                        self.pair_choices[pid] = random.randrange(3)
+            if a in self.pair_choices and b in self.pair_choices:
+                ca, cb = self.pair_choices[a], self.pair_choices[b]
+                self.pair_rw = 0 if (ca - cb) % 3 == 1 else 1 if (cb - ca) % 3 == 1 else -1
+                self.pair_rc = [ca, cb]
                 self.phase, self.timer = "rpsshake", SHAKE_TIME
         elif ph == "rpsshake":
             self.timer -= dt
@@ -230,13 +353,12 @@ class Room:
         elif ph == "rpsr":
             self.timer -= dt
             if self.timer <= 0:
-                if self.rw < 0:                                   # tie: throw again
-                    self.phase, self.timer, self.choices, self.rc = "rps", RPS_TIME, [None, None], None
-                    self.rr += 1
+                a, b = self.pairs[self.pair_idx]
+                if self.pair_rw < 0:                              # tie: this pair throws again
+                    self.start_pair()
                 else:
-                    self.first = self.rw                          # winner's team runs first
-                    self.setup_round()
-                    self.phase, self.timer = "ready", READY_TIME
+                    win_pid, lose_pid = (a, b) if self.pair_rw == 0 else (b, a)
+                    self.finish_pair(win_pid, lose_pid)
         elif ph == "ready":
             self.timer -= dt
             if self.timer <= 0:
@@ -245,20 +367,22 @@ class Room:
             self.timer -= dt
             if self.timer <= 0:
                 self.next_round()
+
         if self.phase == "play":
             if self.mode == "versus":
-                self.step_play(dt)
+                self.step_versus(dt)
             else:
                 self.step_coop(dt)
 
     def step_coop(self, dt):
-        for pid, p in enumerate(self.players):
+        for pid, p in list(self.players.items()):
             if p["done"]:
                 continue
             if p["hurt"] > 0:
                 p["hurt"] -= dt
                 continue
-            dx, dy = p["dx"], p["dy"]
+            inp = self.input.get(pid, {})
+            dx, dy = inp.get("dx", 0), inp.get("dy", 0)
             if dx or dy:
                 k = PLAYER_SPEED * dt / (1.414 if dx and dy else 1)
                 p["x"] = max(COURT_LEFT + 30, min(COURT_RIGHT - 30, p["x"] + dx * k))
@@ -266,7 +390,7 @@ class Room:
             if any(math.hypot(p["x"] - g["x"], p["y"] - g["y"]) < HIT_DISTANCE for g in self.guards):
                 self.score -= p["pts"]                          # tagged: lose this try's points
                 self.events.append(["caught", pid, p["pts"]])
-                p.update(x=START_X[pid], y=START_Y, pts=0, crossed=[False, False],
+                p.update(x=p["start_x"], y=START_Y, pts=0, crossed=[False, False],
                          hurt=HURT_TIME, dx=0, dy=0)
                 continue
             for i, line_y in enumerate((LINE_2, LINE_1)):
@@ -279,49 +403,66 @@ class Room:
                 p["done"], p["pts"] = True, 0
                 self.score += 30
                 self.events.append(["+30", pid])
-        if all(p["done"] for p in self.players):
+        if self.players and all(p["done"] for p in self.players.values()):
             self.score += 50                                     # team bonus
             self.events.append(["+50", -1])
             self.phase = "done"
 
-    def step_play(self, dt):
-        r = self.runner
-        p, gp, hg = self.players[r], self.players[1 - r], self.guards[2]
-        hg["x"] = max(COURT_LEFT + 30, min(COURT_RIGHT - 30,
-                                           hg["x"] + gp["dx"] * HUMAN_GUARD_SPEED * dt))
+    def step_versus(self, dt):
+        for pid, gi in self.guard_of.items():                    # human guards slide their line
+            g = self.guards[gi]
+            dx = self.input.get(pid, {}).get("dx", 0)
+            g["x"] = max(COURT_LEFT + 30, min(COURT_RIGHT - 30, g["x"] + dx * HUMAN_GUARD_SPEED * dt))
+
         self.round_timer -= dt
+        runners = list(self.players.items())
+        for pid, p in runners:
+            if p["done"]:
+                continue
+            if p["hurt"] > 0:
+                p["hurt"] -= dt
+                continue
+            inp = self.input.get(pid, {})
+            dx, dy = inp.get("dx", 0), inp.get("dy", 0)
+            if dx or dy:
+                k = PLAYER_SPEED * dt / (1.414 if dx and dy else 1)
+                p["x"] = max(COURT_LEFT + 30, min(COURT_RIGHT - 30, p["x"] + dx * k))
+                p["y"] = max(COURT_TOP + 30, min(COURT_BOTTOM - 40, p["y"] + dy * k))
+            if any(math.hypot(p["x"] - g["x"], p["y"] - g["y"]) < HIT_DISTANCE for g in self.guards):
+                self.rs[1 - self.runner_team] += GUARD_TAG_BONUS
+                self.events.append(["tag", 1 - self.runner_team, GUARD_TAG_BONUS, pid])
+                p.update(x=p["start_x"], y=START_Y, pts=0, crossed=[False, False],
+                         hurt=HURT_TIME, dx=0, dy=0)
+                continue
+            for i, line_y in enumerate((LINE_2, LINE_1)):
+                if p["y"] <= line_y and not p["crossed"][i]:
+                    p["crossed"][i] = True
+                    p["pts"] += 10
+                    self.rs[self.runner_team] += 10
+                    self.events.append(["+10", self.runner_team, 10, pid])
+            if p["y"] <= COURT_TOP + 30:
+                p["done"], p["pts"] = True, 0
+                self.rs[self.runner_team] += 30
+                self.events.append(["+30", self.runner_team, 30, pid])
 
-        dx, dy = p["dx"], p["dy"]
-        if dx or dy:
-            k = PLAYER_SPEED * dt / (1.414 if dx and dy else 1)
-            p["x"] = max(COURT_LEFT + 30, min(COURT_RIGHT - 30, p["x"] + dx * k))
-            p["y"] = max(COURT_TOP + 30, min(COURT_BOTTOM - 40, p["y"] + dy * k))
-
-        if any(math.hypot(p["x"] - g["x"], p["y"] - g["y"]) < HIT_DISTANCE for g in self.guards):
-            self.end_round("tag", 1 - r, TAG_POINTS, f"Player {2 - r} tagged Player {r + 1}!", r)
-            return
-        for i, line_y in enumerate((LINE_2, LINE_1)):
-            if p["y"] <= line_y and not p["crossed"][i]:
-                p["crossed"][i] = True
-                self.rs[r] += 10
-                self.events.append(["+10", r])
-        if p["y"] <= COURT_TOP + 30:
-            self.end_round("+30", r, 30, f"Player {r + 1} made it across the finish!")
-        elif self.round_timer <= 0:
-            self.end_round("time", 1 - r, TAG_POINTS, "Time's up! The guards win the round.")
-
-    def end_round(self, kind, winner, pts, msg, extra=0):
-        self.rs[winner] += pts
-        self.events.append([kind, winner, pts, extra])
-        self.msg = f"{msg}   +{pts}"
-        self.phase, self.timer = "result", RESULT_TIME
+        all_done = all(p["done"] for _, p in runners) if runners else True
+        if all_done or self.round_timer <= 0:
+            stragglers = sum(1 for _, p in runners if not p["done"])
+            if stragglers:
+                bonus = stragglers * TAG_POINTS
+                self.rs[1 - self.runner_team] += bonus
+                self.events.append(["time", 1 - self.runner_team, bonus, stragglers])
+            self.msg = (f"Team {self.runner_team + 1} got everyone across!" if all_done
+                       else f"Time's up! {stragglers} runner(s) didn't make it.")
+            self.phase, self.timer = "result", RESULT_TIME
 
     def next_round(self):
         self.round += 1
         if self.round > ROUNDS:
             self.phase = "done"
             return
-        self.setup_round()
+        self.runner_team = 1 - self.runner_team
+        self.setup_round_versus()
         self.phase, self.timer = "ready", 2.0
 
     async def run(self):
@@ -333,9 +474,8 @@ class Room:
             self.step(dt)
             frame = ws_frame(1, json.dumps(self.snapshot(), separators=(",", ":")).encode())
             self.events = []
-            for c in self.conns:
-                if c:
-                    c.write(frame)
+            for conn in list(self.conns.values()):
+                conn.write(frame)
 
 
 def new_code():
@@ -392,10 +532,10 @@ async def ws_session(reader, writer, headers, qs):
     if room is None:
         conn.send({"t": "error", "msg": "No game with that code"})
         return
-    pid = room.join(conn)
-    if pid is None:
-        conn.send({"t": "error", "msg": "That game already has 2 players"})
+    if room.phase != "lobby":
+        conn.send({"t": "error", "msg": "This game already started. Ask the host to start a new one, or wait for Play Again."})
         return
+    pid = room.join(conn)
     ips = local_ips()
     conn.send({"t": "welcome", "id": pid, "room": room.code, "mode": room.mode,
                "lan": f"http://{ips[0]}:{SERVER_PORT}",
@@ -533,12 +673,14 @@ const cv=$('cv'), ui=$('ui'), stage=$('stage'), pad=$('pad'), knob=$('knob');
 let ctx=cv.getContext('2d');
 const FONT='"Arial Rounded MT Bold","Trebuchet MS",Verdana,sans-serif';
 const C={sky:'#8BDCF7',grass:'#78C968',grassL:'#82D072',grassD:'#55A84B',court:'#DDB77A',courtAlt:'#D5AD6E',line:'#FFF8E8',white:'#FFFFFF',black:'#292929',navy:'#173B72',blue:'#438FD1',blueD:'#2869A3',red:'#F05B5B',redD:'#C94444',yellow:'#FFD84D',orange:'#F4A340',skin:'#FFD0A6',hair:'#35251F'};
-const PCOL=[C.red,C.yellow];
+const PCOL=[C.red,C.yellow];                                      // offline: fixed P1/P2 colors
+const PCOL_N=[C.red,C.yellow,'#55B879','#A66BE8',C.orange,'#2BBBAD','#E8739A','#8D6E63'];  // online: cycles for any pid
 const CL=190,CR=810,CT=70,CB=550,L1=220,L2=385,MX=500,HUD=65;
 const RPS=['\u270A','\u270B','\u270C\uFE0F'], RPSN=['Rock','Paper','Scissors'];
 
 let ws=null, me=0, room='', lan='', lanAll=[], st=null, disp=null, view='menu', anim=0, last=0, goUntil=0, myChoice=null, connectTimer=null;
 let offline=false, localSim=null;
+let mvOnline={}, gmvOnline=[];                                     // online: per-pid movement flags (dict, not array)
 const LSTART_X=[440,560], LSTART_Y=CB-35, LSPD=250, LGSPD=280, LHGSPD=240, LHIT=46, LROUNDS=4, LRT=20, LTAG=30, LREADY=3.0, LRESULT=2.5, LHURT=1.2;
 let popups=[], lastSend=0, lastDx=9, lastDy=9, gotError=false, courtImg=null;
 let mv=[false,false], gmv=[false,false,false];
@@ -593,6 +735,100 @@ function smooth(dt){
     mv[i]=Math.abs(p[0]-d[0])+Math.abs(p[1]-d[1])>2;d[0]+=(p[0]-d[0])*k;d[1]+=(p[1]-d[1])*k;});
   st.g.forEach((g,i)=>{const d=disp.g[i];gmv[i]=Math.abs(g[0]-d[0])+Math.abs(g[1]-d[1])>2;d[0]+=(g[0]-d[0])*k;d[1]+=(g[1]-d[1])*k;});
   popups.forEach(p=>{p.y-=45*dt;p.life-=dt;});popups=popups.filter(p=>p.life>0);
+}
+
+/* ---------- online: unlimited players (dict-keyed, team-based) ---------- */
+function isHost(){return st&&st.host!=null&&String(st.host)===String(me);}
+function inCurrentPair(){return st&&st.pair&&st.pair.some(p=>p!=null&&String(p)===String(me));}
+
+function smoothOnline(dt){
+  if(!disp)disp={p:{},g:st.g.map(g=>[g[0],g[1]])};
+  const k=1-Math.exp(-dt*20);
+  mvOnline={};
+  for(const pid in st.p){
+    const p=st.p[pid];
+    if(!disp.p[pid])disp.p[pid]=[p[0],p[1]];
+    const d=disp.p[pid];
+    if(Math.abs(p[0]-d[0])>150||Math.abs(p[1]-d[1])>150){d[0]=p[0];d[1]=p[1];}
+    mvOnline[pid]=Math.abs(p[0]-d[0])+Math.abs(p[1]-d[1])>2;
+    d[0]+=(p[0]-d[0])*k;d[1]+=(p[1]-d[1])*k;
+  }
+  for(const pid in disp.p)if(!(pid in st.p))delete disp.p[pid];
+  if(disp.g.length!==st.g.length)disp.g=st.g.map(g=>[g[0],g[1]]);
+  gmvOnline=[];
+  st.g.forEach((g,i)=>{const d=disp.g[i];gmvOnline[i]=Math.abs(g[0]-d[0])+Math.abs(g[1]-d[1])>2;d[0]+=(g[0]-d[0])*k;d[1]+=(g[1]-d[1])*k;});
+  popups.forEach(p=>{p.y-=45*dt;p.life-=dt;});popups=popups.filter(p=>p.life>0);
+}
+
+function drawWorldOnline(){
+  const ents=[];
+  st.g.forEach((g,i)=>ents.push({y:disp.g[i][1],k:'g',i}));
+  for(const pid in st.p)ents.push({y:disp.p[pid][1],k:'p',pid});
+  ents.sort((a,b)=>a.y-b.y);
+  for(const e of ents){
+    if(e.k==='g'){
+      const x=disp.g[e.i][0],y=disp.g[e.i][1],owner=st.g[e.i][3];
+      if(owner!=null){
+        const col=PCOL_N[Number(owner)%PCOL_N.length];
+        person(x,y,col,.75,gmvOnline[e.i]?anim:0,gmvOnline[e.i]?7:0);
+        if(String(owner)===String(me))marker(x,y);else txt('P'+(Number(owner)+1),x,y-38,14,C.navy);
+      }else if(st.g[e.i][2])person(x,y,C.blue,.75,anim);
+      else person(x,y,C.blueD,.75,anim*.2,3);
+    }else{
+      const pid=e.pid,x=disp.p[pid][0],y=disp.p[pid][1],done=st.p[pid][2],hurt=st.p[pid][3];
+      if(hurt>0&&Math.floor(anim*.35)%2===0)continue;
+      const mv_=mvOnline[pid]&&!done,col=PCOL_N[Number(pid)%PCOL_N.length];
+      if(String(pid)===String(me))ell(x,y+76,30,6,null,C.yellow,4);
+      person(x,y-(mv_?Math.abs(Math.sin(anim))*3:0),col,.85,mv_?anim:0,mv_?7:0);
+      if(done)txt('SAFE \u2713',x,y-38,14,C.navy);
+      else if(String(pid)===String(me))marker(x,y);else txt('P'+(Number(pid)+1),x,y-38,14,C.navy);
+    }
+  }
+  for(const p of popups)txt(p.t,p.x,p.y,24,p.c,C.navy);
+}
+
+function drawOverlayOnline(){
+  const ph=st.ph;
+  if(ph==='ready'){
+    if(st.mode==='versus'){
+      const myTeam=st.team?st.team[me]:null;
+      const amRunning=myTeam!=null&&myTeam===st.runnerTeam;
+      txt('ROUND '+st.rd+' OF '+st.tot,500,170,34,C.white,C.navy);
+      txt(myTeam==null?('TEAM '+(st.runnerTeam+1)+' RUNS this round'):
+          (amRunning?'YOUR TEAM RUNS!  Cross both lines and reach the FINISH':'YOUR TEAM GUARDS!  Slide \u2190 \u2192 on your line and TAG the runners'),
+          500,225,20,C.white,C.navy);
+    }else{
+      txt('GET READY!',500,170,34,C.white,C.navy);
+      txt('Everyone runs!  Dodge the guards and reach the FINISH',500,225,22,C.white,C.navy);
+    }
+    txt(String(Math.max(1,Math.ceil(st.tm))),500,320,80,C.yellow,C.navy);
+  }else if(ph==='play'&&performance.now()<goUntil){txt('GO!',500,300,70,C.white,C.navy);}
+  else if(ph==='result'){cardBox(220,200,780,370);txt(st.msg,500,258,20,C.navy);txt('TEAM 1: '+st.rs[0]+'    TEAM 2: '+st.rs[1],500,318,26,C.orange);}
+  else if(ph==='rpsshake'){
+    const total=1.6,elapsed=total-st.tm,seg=total/3,idx=Math.max(0,Math.min(2,Math.floor(elapsed/seg)));
+    const words=['JACK','EN','POY!'],localT=Math.max(0,Math.min(1,(elapsed%seg)/seg)),bounce=Math.sin(localT*Math.PI)*55;
+    const pair=st.pair||[null,null];
+    txt(words[idx],500,150,54,C.yellow,C.navy);
+    txt('\u270A',350,300-bounce,90,C.white,C.navy);txt('\u270A',650,300-bounce,90,C.white,C.navy);
+    txt('P'+(Number(pair[0])+1),350,395,18,C.white,C.navy);txt('P'+(Number(pair[1])+1),650,395,18,C.white,C.navy);
+  }
+}
+
+function drawHudOnline(){
+  box(0,0,1000,HUD,C.sky);
+  txt('PATINTERO',25,33,27,C.white,C.navy,'left');
+  if(!st)return;
+  const vs=st.mode==='versus';
+  txt(vs?'\u2B50 T1: '+st.rs[0]+'   T2: '+st.rs[1]:'\u2B50 TEAM SCORE: '+st.sc,vs?380:420,33,21,C.navy);
+  if(!vs){const safeCount=Object.values(st.p).filter(p=>p[2]).length;
+    txt('SAFE: '+safeCount+' / '+st.roster.length,900,33,22,C.navy,null,'right');return;}
+  const inRound=['ready','play','result'].includes(st.ph);
+  if(inRound){
+    const myTeam=st.team?st.team[me]:null;
+    if(myTeam==null)txt('SPECTATING',650,33,18,C.navy);
+    else txt(myTeam===st.runnerTeam?'YOU: RUNNER':'YOU: GUARD',650,33,20,myTeam===st.runnerTeam?C.redD:C.blueD);
+  }
+  if(inRound)txt('R'+Math.min(st.rd,st.tot)+'/'+st.tot+(st.ph==='play'?'  \u23F1'+Math.ceil(st.rt):''),900,33,20,C.navy,null,'right');
 }
 
 function drawWorld(){
@@ -821,22 +1057,36 @@ function onMsg(m){
   clearTimeout(connectTimer);
   if(m.t==='welcome'){me=m.id;room=m.room;lan=m.lan||'';lanAll=m.lanAll||(lan?[lan]:[]);view='game';st=null;disp=null;popups=[];myChoice=null;setUI('');$('leave').style.display='block';pad.style.display='';}
   else if(m.t==='error'){gotError=true;const s=ws;ws=null;if(s)try{s.close();}catch(e){}setStatus(m.msg);}
-  else if(m.t==='s')applyState(m);
+  else if(m.t==='s')applyStateOnline(m);
 }
 function pop(p,t,c){popups.push({x:p[0],y:p[1]-50,t,c,life:.9});}
-function applyState(m){
+function applyStateOnline(m){
   const prev=st;st=m;
-  if(!disp)disp={p:m.p.map(p=>[p[0],p[1]]),g:m.g.map(g=>[g[0],g[1]])};
+  if(!disp)disp={p:{},g:m.g.map(g=>[g[0],g[1]])};
   if(prev&&prev.ph==='ready'&&m.ph==='play')goUntil=performance.now()+800;
-  for(const ev of m.ev){const k=ev[0];
-    if(k==='tag')pop(disp.p[ev[3]],'TAGGED!  +'+ev[2],C.red);
-    else if(k==='time')pop([500,300],"TIME'S UP!",C.red);
-    else if(k==='+10')pop(disp.p[ev[1]],'+10',C.yellow);
-    else if(k==='+30')pop(disp.p[ev[1]],'+30 FINISH!',C.orange);
-    else if(k==='caught')pop(disp.p[ev[1]],ev[2]?'CAUGHT!  -'+ev[2]:'CAUGHT!',C.red);
-    else if(k==='+50')pop([500,300],'+50 TEAM BONUS!',C.yellow);}
-  if(!prev||prev.ph!==m.ph||prev.rr!==m.rr){if(m.ph==='rps')myChoice=null;phaseUI();}
-  if(m.ph==='rps'){const t=$('tm');if(t)t.textContent=Math.ceil(m.tm);const o=$('opp');if(o)o.textContent=m.ch[1-me]?'Opponent is ready \u2713':'Opponent is choosing\u2026';}
+  for(const ev of m.ev){
+    const k=ev[0];
+    if(m.mode==='coop'){
+      const pos=m.p[ev[1]]||[500,300];
+      if(k==='caught')pop(pos,ev[2]?'CAUGHT!  -'+ev[2]:'CAUGHT!',C.red);
+      else if(k==='+10')pop(pos,'+10',C.yellow);
+      else if(k==='+30')pop(pos,'+30 FINISH!',C.orange);
+      else if(k==='+50')pop([500,300],'+50 TEAM BONUS!',C.yellow);
+    }else{
+      const pos=(ev[3]!=null&&m.p[ev[3]])||[500,300];
+      if(k==='tag')pop(pos,'TAGGED!  +'+ev[2],C.red);
+      else if(k==='+10')pop(pos,'+10',C.yellow);
+      else if(k==='+30')pop(pos,'+30 FINISH!',C.orange);
+      else if(k==='time')pop([500,300],'+'+ev[2]+' TEAM BONUS!',C.red);
+    }
+  }
+  const rosterChanged=m.ph==='lobby'&&prev&&JSON.stringify(prev.roster)!==JSON.stringify(m.roster);
+  if(!prev||prev.ph!==m.ph||rosterChanged){if(m.ph==='rps')myChoice=null;phaseUI();}
+  if(m.ph==='rps'&&m.pair){
+    const t=$('tm');if(t)t.textContent=Math.ceil(m.tm);
+    const myIdx=String(m.pair[0])===String(me)?0:1,oppIdx=1-myIdx;
+    const o=$('opp');if(o)o.textContent=m.ch[oppIdx]?'Opponent is ready \u2713':'Opponent is choosing\u2026';
+  }
 }
 
 /* ---------- DOM screens ---------- */
@@ -847,31 +1097,50 @@ function menuUI(msg){
   setUI('<div class="card"><h1>PATINTERO</h1><div class="sub">Takbo \u2022 Iwas \u2022 Pumasa</div>'+
    '<div class="or">create a game</div>'+
    '<div><button class="btn y" onclick="createGame(\'coop\')">\uD83E\uDD1D CO-OP</button><button class="btn y" onclick="createGame(\'versus\')">\u2694\uFE0F VERSUS</button></div>'+
-   '<div class="small">CO-OP: both run past the guards \u2022 VERSUS: runners vs guards</div>'+
+   '<div class="small">Any number of players can join \u2022 CO-OP: everyone runs together \u2022 VERSUS: Jack en poy pairs everyone up to split two teams</div>'+
    '<div class="or">\u2014 or join a friend \u2014</div>'+
    '<div><input id="code" maxlength="4" placeholder="CODE" value="'+pre+'" autocapitalize="characters" autocomplete="off"><button class="btn" onclick="joinGame()">\uD83C\uDF10 JOIN</button></div>'+
    '<div id="status" class="status">'+(msg||'')+'</div>'+
    '<div class="or">\u2014 or play offline on this device (optional) \u2014</div>'+
    '<div><button class="btn" onclick="startOffline(\'coop\')">\uD83E\uDD1D CO-OP</button><button class="btn" onclick="startOffline(\'versus\')">\u2694\uFE0F VERSUS</button></div>'+
-   '<div class="small">No internet or Wi-Fi needed. Share one keyboard \u2014 P1: WASD, P2: Arrow keys.</div>'+
-   '<div class="small">2 players \u2022 in VERSUS, <b>Jack en poy</b> picks the team</div></div>');
+   '<div class="small">No internet or Wi-Fi needed. Share one keyboard \u2014 P1: WASD, P2: Arrow keys. (2 players only)</div></div>');
 }
 function phaseUI(){
   const ph=st.ph;
-  if(ph==='lobby')setUI('<div class="card"><div class="big">WAITING FOR PLAYER 2\u2026</div><div class="small">'+(st.mode==='versus'?'\u2694\uFE0F VERSUS':'\uD83E\uDD1D CO-OP')+'</div><div>Game code</div><div class="code">'+room+'</div>'+
-    '<a class="btn y" href="'+mailto()+'">\uD83D\uDCE7 EMAIL INVITE</a><button class="btn" onclick="invite()">'+(navigator.share?'\uD83D\uDCE4 SHARE':'\uD83D\uDCCB COPY LINK')+'</button>'+
-    '<div class="small">'+inviteUrl()+'</div><div class="small">'+(location.protocol==='https:'?'Works from anywhere \u2713':'Same Wi-Fi only \u2014 for another network, open this game through your tunnel link first')+'</div>'+
-    (lanAll.length>1?'<div class="small">Link not working? Ask them to try: '+lanAll.map(a=>a+'/?room='+room).join('  \u2022  ')+'</div>':'')+
-    '<div id="note" class="small"></div></div>');
-  else if(ph==='rps')setUI('<div class="card"><div class="big">JACK EN POY!</div>'+
-    '<div class="small">Winner\'s team <b>RUNS</b> first \u2022 the loser\'s team <b>guards</b> (taya)</div><div class="rpsrow">'+
-    RPS.map((e,i)=>'<button class="btn rps" id="r'+i+'" onclick="pick('+i+')">'+e+'<small>'+RPSN[i]+'</small></button>').join('')+
-    '</div><div>Time: <b id="tm">'+Math.ceil(st.tm)+'</b></div><div id="opp" class="small"></div></div>');
-  else if(ph==='rpsr'){
-    const w=st.rw,mine=st.rc[me],theirs=st.rc[1-me];
-    const res=w<0?"IT'S A TIE! Throw again\u2026":(w===me?'YOU WIN! Your team RUNS first \uD83C\uDFC3':'You lost. Your team GUARDS first \uD83D\uDEE1');
-    setUI('<div class="card"><div class="big">JACK EN POY!</div><div class="reveal"><div><span class="hand">'+RPS[mine]+'</span><br>YOU</div><div class="vs">VS</div><div><span class="hand">'+RPS[theirs]+'</span><br>THEM</div></div>'+
-      '<div class="big '+(w<0?'':w===me?'win':'lose')+'">'+res+'</div></div>');
+  if(ph==='lobby'){
+    const names=st.roster.map(pid=>'P'+(Number(pid)+1)).join(', ')||'(none yet)';
+    const hostNow=isHost();
+    setUI('<div class="card"><div class="big">LOBBY</div><div class="small">'+(st.mode==='versus'?'\u2694\uFE0F VERSUS':'\uD83E\uDD1D CO-OP')+'</div><div>Game code</div><div class="code">'+room+'</div>'+
+      '<div class="small">'+st.roster.length+' joined: '+names+'</div>'+
+      '<a class="btn y" href="'+mailto()+'">\uD83D\uDCE7 EMAIL INVITE</a><button class="btn" onclick="invite()">'+(navigator.share?'\uD83D\uDCE4 SHARE':'\uD83D\uDCCB COPY LINK')+'</button>'+
+      '<div class="small">'+inviteUrl()+'</div><div class="small">'+(location.protocol==='https:'?'Works from anywhere \u2713':'Same Wi-Fi only \u2014 for another network, open this game through your tunnel link first')+'</div>'+
+      (lanAll.length>1?'<div class="small">Link not working? Ask them to try: '+lanAll.map(a=>a+'/?room='+room).join('  \u2022  ')+'</div>':'')+
+      (hostNow?'<button class="btn y" onclick="send({t:\'start\'})"'+(st.roster.length<2?' disabled':'')+'>\u25B6 START ('+st.roster.length+' player'+(st.roster.length===1?'':'s')+')</button>'+
+        (st.roster.length<2?'<div class="small">Need at least 2 players to start</div>':'')
+       :'<div class="small">Waiting for the host to start\u2026</div>')+
+      '<div id="note" class="small"></div></div>');
+  }else if(ph==='rps'){
+    const pairLabel='Pair '+st.pairNum+' of '+st.pairTotal;
+    if(inCurrentPair()){
+      setUI('<div class="card"><div class="big">JACK EN POY!</div><div class="small">'+pairLabel+' \u2022 Winner\'s team <b>RUNS</b> first, loser\'s <b>guards</b> (taya)</div><div class="rpsrow">'+
+        RPS.map((e,i)=>'<button class="btn rps" id="r'+i+'" onclick="pick('+i+')">'+e+'<small>'+RPSN[i]+'</small></button>').join('')+
+        '</div><div>Time: <b id="tm">'+Math.ceil(st.tm)+'</b></div><div id="opp" class="small"></div></div>');
+    }else{
+      const names=(st.pair||[]).filter(p=>p!=null).map(p=>'P'+(Number(p)+1)).join('  vs  ');
+      setUI('<div class="card"><div class="big">JACK EN POY!</div><div class="small">'+pairLabel+'</div>'+
+        '<div class="big">'+names+'</div><div class="small">Watching\u2026 your turn is coming up</div></div>');
+    }
+  }else if(ph==='rpsr'){
+    const w=st.rw,pair=st.pair||[null,null],a=pair[0],b=pair[1],rc=st.rc||[0,0];
+    const winnerPid=w<0?null:(w===0?a:b),iInPair=String(a)===String(me)||String(b)===String(me);
+    let res,cls;
+    if(w<0){res="IT'S A TIE! Throwing again\u2026";cls='';}
+    else if(String(winnerPid)===String(me)){res='YOU WIN! Your team RUNS first \uD83C\uDFC3';cls='win';}
+    else if(iInPair){res='You lost. Your team GUARDS first \uD83D\uDEE1';cls='lose';}
+    else{res='P'+(Number(winnerPid)+1)+' WINS! Their team runs first \uD83C\uDFC3';cls='';}
+    setUI('<div class="card"><div class="big">JACK EN POY!</div><div class="small">Pair '+st.pairNum+' of '+st.pairTotal+'</div>'+
+      '<div class="reveal"><div><span class="hand">'+RPS[rc[0]]+'</span><br>P'+(Number(a)+1)+'</div><div class="vs">VS</div><div><span class="hand">'+RPS[rc[1]]+'</span><br>P'+(Number(b)+1)+'</div></div>'+
+      '<div class="big '+cls+'">'+res+'</div></div>');
   }else if(ph==='rps1'||ph==='rps2'){
     const p1=ph==='rps1';
     setUI('<div class="card"><div class="big">'+(p1?'PLAYER 1':'PLAYER 2')+': CHOOSE!</div>'+
@@ -890,9 +1159,17 @@ function phaseUI(){
     if(!vs)t='TEAM VICTORY! \uD83C\uDFC6';
     else if(a===b)t="IT'S A DRAW!";
     else if(offline)t=(a>b?'PLAYER 1':'PLAYER 2')+' WINS! \uD83C\uDFC6';
-    else t=(a>b)===(me===0)?'YOU WIN! \uD83C\uDFC6':'YOU LOST \u2014 GG!';
-    setUI('<div class="card"><div class="big">'+t+'</div><div>'+(vs?'Final score':'Both players passed!')+'</div><div class="score">'+(vs?'P1 '+a+' \u2014 '+b+' P2':'\u2B50 '+st.sc)+'</div>'+
-      '<button class="btn y" id="again" onclick="playAgain()">\u21BB PLAY AGAIN</button><button class="btn" onclick="toMenu(\'\')">\u2302 LEAVE</button></div>');
+    else{
+      const myTeam=st.team?st.team[me]:null;
+      t=(myTeam==null)?((a>b?'TEAM 1':'TEAM 2')+' WINS! \uD83C\uDFC6')
+        :(((a>b)===(myTeam===0))?'YOUR TEAM WINS! \uD83C\uDFC6':'YOUR TEAM LOST \u2014 GG!');
+    }
+    const scoreLine=vs?(offline?'P1 '+a+' \u2014 '+b+' P2':'TEAM 1: '+a+'   \u2014   TEAM 2: '+b):'\u2B50 '+st.sc;
+    const canRestart=offline||isHost();
+    setUI('<div class="card"><div class="big">'+t+'</div><div>'+(vs?'Final score':'Everyone passed!')+'</div><div class="score">'+scoreLine+'</div>'+
+      (canRestart?'<button class="btn y" id="again" onclick="playAgain()">\u21BB PLAY AGAIN</button>'
+                 :'<div class="small">Waiting for the host to start a new game\u2026</div>')+
+      '<button class="btn" onclick="toMenu(\'\')">\u2302 LEAVE</button></div>');
   }else setUI('');
 }
 function pick(i){
@@ -936,10 +1213,10 @@ function frame(now){
   if(view==='menu'){drawMenu(now/1000);return;}
   box(0,0,1000,720,C.sky);ctx.drawImage(courtImg,0,HUD);
   if(offline){stepOffline(dt);ctx.save();ctx.translate(0,HUD);drawWorld();drawOverlay();ctx.restore();drawHud();return;}
-  if(!st){txt('Connecting\u2026',500,360,30,C.white,C.navy);drawHud();return;}
-  smooth(dt);
-  ctx.save();ctx.translate(0,HUD);drawWorld();drawOverlay();ctx.restore();
-  drawHud();sendInput(now);
+  if(!st){txt('Connecting\u2026',500,360,30,C.white,C.navy);drawHudOnline();return;}
+  smoothOnline(dt);
+  ctx.save();ctx.translate(0,HUD);drawWorldOnline();drawOverlayOnline();ctx.restore();
+  drawHudOnline();sendInput(now);
 }
 buildCourt();fit();menuUI('');
 {const pre=(new URLSearchParams(location.search).get('room')||'').replace(/[^A-Za-z]/g,'');if(pre.length===4)connect('room='+pre);}
