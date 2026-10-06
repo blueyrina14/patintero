@@ -652,7 +652,8 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
 #pad{display:none;position:relative;flex:none;width:var(--padsz);height:var(--padsz);border-radius:50%;background:rgba(23,59,114,.28);border:3px solid rgba(255,255,255,.75)}
 #pad i{position:absolute;font-style:normal;color:#fff;font-size:calc(var(--padsz)*.15);transform:translate(-50%,-50%);pointer-events:none}
 #knob{position:absolute;left:50%;top:50%;width:36%;height:36%;margin:-18% 0 0 -18%;border-radius:50%;background:#fff;opacity:.9;pointer-events:none}
-@media (pointer:coarse){:root{--padsz:min(18vmin,100px)} #pad{display:block}}
+@media (pointer:coarse),(hover:none){:root{--padsz:min(18vmin,100px)} #pad{display:block}}
+@media (pointer:coarse) and (min-width:600px),(hover:none) and (min-width:600px){:root{--padsz:min(14vmin,150px)}}
 @media (orientation:portrait){#app{flex-direction:column;justify-content:flex-start;padding-top:1vh;gap:1.2vh}
   :root{--padsz:min(20vw,100px)}
   #stage{width:min(100vw,calc((100dvh - var(--padsz) - 6vh)*1000/720))}}
@@ -1055,7 +1056,7 @@ function toMenu(msg){const s=ws;ws=null;if(s)try{s.close();}catch(e){}offline=fa
   view='menu';st=null;disp=null;popups=[];$('leave').style.display='none';menuUI(msg);}
 function onMsg(m){
   clearTimeout(connectTimer);
-  if(m.t==='welcome'){me=m.id;room=m.room;lan=m.lan||'';lanAll=m.lanAll||(lan?[lan]:[]);view='game';st=null;disp=null;popups=[];myChoice=null;setUI('');$('leave').style.display='block';pad.style.display='';}
+  if(m.t==='welcome'){me=m.id;room=m.room;lan=m.lan||'';lanAll=m.lanAll||(lan?[lan]:[]);view='game';st=null;disp=null;popups=[];myChoice=null;setUI('');$('leave').style.display='block';pad.style.display='none';}
   else if(m.t==='error'){gotError=true;const s=ws;ws=null;if(s)try{s.close();}catch(e){}setStatus(m.msg);}
   else if(m.t==='s')applyStateOnline(m);
 }
@@ -1081,7 +1082,11 @@ function applyStateOnline(m){
     }
   }
   const rosterChanged=m.ph==='lobby'&&prev&&JSON.stringify(prev.roster)!==JSON.stringify(m.roster);
-  if(!prev||prev.ph!==m.ph||rosterChanged){if(m.ph==='rps')myChoice=null;phaseUI();}
+  if(!prev||prev.ph!==m.ph||rosterChanged){
+    if(m.ph==='rps')myChoice=null;
+    pad.style.display=(m.ph==='ready'||m.ph==='play')?'':'none';
+    phaseUI();
+  }
   if(m.ph==='rps'&&m.pair){
     const t=$('tm');if(t)t.textContent=Math.ceil(m.tm);
     const myIdx=String(m.pair[0])===String(me)?0:1,oppIdx=1-myIdx;
