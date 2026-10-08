@@ -649,6 +649,7 @@ a.btn{display:inline-block;text-decoration:none}
 .hand{font-size:calc(var(--u)*11)} .vs{font-size:calc(var(--u)*3.4);color:#F4A340}
 input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align:center;text-transform:uppercase;border:calc(var(--u)*.35) solid #173B72;border-radius:calc(var(--u)*1.4);padding:calc(var(--u)*1) 0;color:#173B72;-webkit-user-select:text;user-select:text}
 #leave{position:absolute;top:1%;right:1%;display:none;width:calc(var(--u)*5);height:calc(var(--u)*5);border-radius:50%;border:0;background:#fff;color:#173B72;font-size:calc(var(--u)*2.6);font-weight:bold;opacity:.9;cursor:pointer}
+#mute{position:absolute;top:calc(var(--u)*6.6);right:1%;width:calc(var(--u)*5);height:calc(var(--u)*5);border-radius:50%;border:0;background:#fff;color:#173B72;font-size:calc(var(--u)*2.4);line-height:1;padding:0;opacity:.9;cursor:pointer;z-index:7;touch-action:manipulation}
 #pad{display:none;position:relative;flex:none;width:var(--padsz);height:var(--padsz);border-radius:50%;background:rgba(23,59,114,.28);border:3px solid rgba(255,255,255,.75)}
 #pad i{position:absolute;font-style:normal;color:#fff;font-size:calc(var(--padsz)*.15);transform:translate(-50%,-50%);pointer-events:none}
 #knob{position:absolute;left:50%;top:50%;width:36%;height:36%;margin:-18% 0 0 -18%;border-radius:50%;background:#fff;opacity:.9;pointer-events:none}
@@ -672,6 +673,7 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
     <canvas id="cv" width="1000" height="720"></canvas>
     <div id="ui"></div>
     <button id="leave" onclick="toMenu('')">&#10005;</button>
+    <button id="mute" aria-label="Toggle music">&#128266;</button>
     <div id="opadlbl1" class="opadlbl">P1</div>
     <div id="opad1" class="opad"><i style="left:50%;top:12%">&#9650;</i><i style="left:50%;top:88%">&#9660;</i><i style="left:12%;top:50%">&#9664;</i><i style="left:88%;top:50%">&#9654;</i><div id="oknob1" class="oknob"></div></div>
     <div id="opadlbl2" class="opadlbl">P2</div>
@@ -683,6 +685,7 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
 "use strict";
 const $=id=>document.getElementById(id);
 const cv=$('cv'), ui=$('ui'), stage=$('stage'), pad=$('pad'), knob=$('knob');
+const muteBtn=$('mute');
 const opad1=$('opad1'), oknob1=$('oknob1'), opadlbl1=$('opadlbl1');
 const opad2=$('opad2'), oknob2=$('oknob2'), opadlbl2=$('opadlbl2');
 let ctx=cv.getContext('2d');
@@ -1013,7 +1016,7 @@ function stepOffline(dt){
   mv=[dx1!==0||dy1!==0,dx2!==0||dy2!==0];
   gmv=[snap.g[0][2]===1,false,localSim.mode==='versus'?(localSim.players[1-localSim.runner].dx!==0):(snap.g[2][2]===1)];
   popups.forEach(x=>{x.y-=45*dt;x.life-=dt;});popups=popups.filter(x=>x.life>0);
-  if(prevPh!==snap.ph){setOfflinePads(snap.ph==='ready'||snap.ph==='play');phaseUI();}
+  if(prevPh!==snap.ph){setOfflinePads(snap.ph==='ready'||snap.ph==='play');Music.setMood(['ready','play','result'].includes(snap.ph)?'play':'menu');phaseUI();}
 }
 
 /* ---------- input ---------- */
@@ -1030,6 +1033,7 @@ function sendInput(now){
 addEventListener('keydown',e=>{
   const k=e.key.toLowerCase();
   if(e.target.tagName==='INPUT'){if(k==='enter')joinGame();return;}
+  if(k==='m'&&!e.repeat){Music.toggle();return;}
   if(k.startsWith('arrow')||k===' ')e.preventDefault();
   if(k==='escape'&&view==='game'){toMenu('');return;}
   keys.add(k);
@@ -1053,6 +1057,110 @@ function makePad(padEl,knobEl,state){
 makePad(pad,knob,padState);            // online: the single joystick
 makePad(opad1,oknob1,padState1);       // offline: player 1's joystick (bottom-left)
 makePad(opad2,oknob2,padState2);       // offline: player 2's joystick (bottom-right)
+
+/* ---------- music: synthesized live with Web Audio (no audio files, works offline) ---------- */
+const Music=(()=>{
+  const AC=window.AudioContext||window.webkitAudioContext, VOL=.5;
+  const mtof=n=>440*Math.pow(2,(n-69)/12);
+  const x8=a=>a.flatMap(v=>v>0?[v,-1]:[v,v]);            // 8 eighth-note slots -> 16 sixteenths (-1 = hold, 0 = rest)
+  const ARP=[0,1,2,3,2,1,0,1,2,3,2,1,0,1,2,3];
+  const TRACKS={
+    menu:{bpm:104,                                        // relaxed, bouncy C major: lobby / menus / Jack en poy
+      bass:[36,45,41,43], chords:[[60,64,67],[57,60,64],[53,57,60],[55,59,62]],
+      lead:[x8([76,-1,79,76,72,-1,74,76]),x8([72,-1,76,72,69,-1,71,72]),x8([69,-1,72,69,65,-1,67,69]),x8([71,-1,74,71,67,69,71,74])]},
+    play:{bpm:136,                                        // driving A minor chase: ready / play / results
+      bass:[45,41,36,43], chords:[[57,60,64,69],[53,57,60,65],[55,60,64,67],[55,59,62,67]],
+      lead:[[76,-1,-1,76,79,-1,76,-1,72,-1,-1,72,76,-1,74,-1],[77,-1,-1,77,81,-1,77,-1,72,-1,-1,72,77,-1,76,-1],
+            [76,-1,-1,76,79,-1,76,-1,72,-1,-1,74,76,-1,79,-1],[74,-1,-1,74,79,-1,74,-1,71,-1,-1,71,74,-1,76,-1]]}
+  };
+  let ctx=null,master=null,lead=null,delay=null,noise=null,timer=null,mood='menu',step=0,next=0,muted=false;
+  try{muted=localStorage.getItem('patintero_muted')==='1';}catch(e){}
+  const stepDur=()=>60/TRACKS[mood].bpm/4;
+
+  function build(){
+    ctx=new AC();
+    const comp=ctx.createDynamicsCompressor();
+    master=ctx.createGain();master.gain.value=muted?0:VOL;
+    master.connect(comp);comp.connect(ctx.destination);
+    lead=ctx.createGain();lead.connect(master);
+    delay=ctx.createDelay(1);const fb=ctx.createGain(),wet=ctx.createGain();
+    fb.gain.value=.3;wet.gain.value=.3;
+    lead.connect(delay);delay.connect(fb);fb.connect(delay);delay.connect(wet);wet.connect(master);
+    delay.delayTime.value=stepDur()*3;                    // dotted-eighth echo on the melody
+    const n=ctx.sampleRate;noise=ctx.createBuffer(1,n,n);
+    const d=noise.getChannelData(0);for(let i=0;i<n;i++)d[i]=Math.random()*2-1;
+  }
+  function tone(type,freq,t,dur,vol,dest,lp){
+    const o=ctx.createOscillator(),g=ctx.createGain();
+    o.type=type;o.frequency.value=freq;
+    let out=o;
+    if(lp){const f=ctx.createBiquadFilter();f.type='lowpass';f.frequency.value=lp;o.connect(f);out=f;}
+    out.connect(g);g.connect(dest||master);
+    g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(vol,t+.006);
+    g.gain.setValueAtTime(vol,t+Math.max(.007,dur));g.gain.linearRampToValueAtTime(0,t+Math.max(.007,dur)+.05);
+    o.start(t);o.stop(t+Math.max(.007,dur)+.08);
+  }
+  function kick(t,v){
+    const o=ctx.createOscillator(),g=ctx.createGain();o.type='sine';
+    o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(45,t+.12);
+    g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(.001,t+.16);
+    o.connect(g);g.connect(master);o.start(t);o.stop(t+.2);
+  }
+  function hit(t,v,hp,dur){
+    const sr=ctx.createBufferSource(),f=ctx.createBiquadFilter(),g=ctx.createGain();
+    sr.buffer=noise;f.type='highpass';f.frequency.value=hp;
+    g.gain.setValueAtTime(v,t);g.gain.exponentialRampToValueAtTime(.001,t+dur);
+    sr.connect(f);f.connect(g);g.connect(master);sr.start(t);sr.stop(t+dur+.02);
+  }
+  function playStep(i,t){
+    const T=TRACKS[mood],bar=Math.floor(i/16)%4,s=i%16,sd=stepDur(),L=T.lead[bar][s];
+    if(L>0){let n=1;while(s+n<16&&T.lead[bar][s+n]===-1)n++;tone('square',mtof(L),t,n*sd*.92,.1,lead,3200);}
+    if(mood==='menu'){
+      if(s===0||s===8)tone('sawtooth',mtof(T.bass[bar]),t,sd*3,.2,null,500);
+      if(s===4||s===12){tone('sawtooth',mtof(T.bass[bar]+7),t,sd*3,.2,null,500);T.chords[bar].forEach(n=>tone('square',mtof(n),t,sd*1.6,.04,null,1800));hit(t,.12,1500,.12);}
+      if(s===0||s===8)kick(t,.4);
+      if(s%4===2)hit(t,.04,7000,.04);
+    }else{
+      if(s%2===0)tone('sawtooth',mtof(T.bass[bar]+((s===4||s===12)?12:0)),t,sd*1.6,.2,null,550);
+      tone('square',mtof(T.chords[bar][ARP[s]]),t,sd*.8,.032,null,2600);
+      if(s%4===0)kick(t,.45);
+      if(s===4||s===12){hit(t,.16,1500,.13);tone('triangle',190,t,.06,.07);}
+      if(s%2===0)hit(t,s%4===2?.07:.03,7000,.04);
+    }
+  }
+  function tick(){
+    if(!ctx||ctx.state!=='running')return;
+    const now=ctx.currentTime;
+    if(next<now)next=now+.05;                             // fell behind (background tab): resync
+    while(next<now+.14){playStep(step,next);next+=stepDur();step++;}
+  }
+  function updateButton(){muteBtn.textContent=muted?'\uD83D\uDD07':'\uD83D\uDD0A';muteBtn.title=muted?'Music off (M)':'Music on (M)';}
+  function unlock(){                                      // browsers only allow audio after a tap/keypress
+    if(muted||!AC)return;
+    try{if(!ctx)build();if(ctx.state==='suspended')ctx.resume();if(!timer)timer=setInterval(tick,40);}catch(e){}
+  }
+  function setMood(m){
+    if(m===mood||!TRACKS[m])return;
+    mood=m;step=0;
+    if(ctx){next=Math.max(next,ctx.currentTime+.05);delay.delayTime.value=stepDur()*3;}
+  }
+  function toggle(){
+    muted=!muted;
+    try{localStorage.setItem('patintero_muted',muted?'1':'0');}catch(e){}
+    updateButton();
+    if(!AC)return;
+    if(muted){if(ctx){master.gain.setTargetAtTime(0,ctx.currentTime,.03);setTimeout(()=>{if(muted&&ctx)ctx.suspend();},200);}}
+    else{unlock();if(ctx)master.gain.setTargetAtTime(VOL,ctx.currentTime,.05);}
+  }
+  ['pointerdown','keydown','touchend'].forEach(ev=>addEventListener(ev,unlock,{passive:true}));
+  if(document.addEventListener)document.addEventListener('visibilitychange',()=>{
+    if(!ctx||muted)return;
+    if(document.hidden)ctx.suspend();else ctx.resume();
+  });
+  muteBtn.addEventListener('click',toggle);
+  updateButton();
+  return{unlock,setMood,toggle,updateButton,tracks:TRACKS,get muted(){return muted;},get mood(){return mood;}};
+})();
 
 /* ---------- networking ---------- */
 function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -1107,6 +1215,7 @@ function applyStateOnline(m){
   if(!prev||prev.ph!==m.ph||rosterChanged){
     if(m.ph==='rps')myChoice=null;
     pad.style.display=(m.ph==='ready'||m.ph==='play')?'':'none';
+    Music.setMood(['ready','play','result'].includes(m.ph)?'play':'menu');
     phaseUI();
   }
   if(m.ph==='rps'&&m.pair){
@@ -1119,6 +1228,7 @@ function applyStateOnline(m){
 /* ---------- DOM screens ---------- */
 function setUI(h){ui.innerHTML=h;ui.style.display=h?'flex':'none';}
 function menuUI(msg){
+  Music.setMood('menu');
   pad.style.display='none';
   opad1.style.display=opad2.style.display=opadlbl1.style.display=opadlbl2.style.display='none';
   const pre=(new URLSearchParams(location.search).get('room')||'').replace(/[^A-Za-z]/g,'').slice(0,4);
@@ -1260,4 +1370,3 @@ if __name__ == "__main__":
         asyncio.run(main(chosen_port))
     except KeyboardInterrupt:
         print("\nStopped.")
-        
