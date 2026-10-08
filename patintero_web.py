@@ -654,6 +654,14 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
 #knob{position:absolute;left:50%;top:50%;width:36%;height:36%;margin:-18% 0 0 -18%;border-radius:50%;background:#fff;opacity:.9;pointer-events:none}
 @media (pointer:coarse),(hover:none){:root{--padsz:min(28vmin,170px)} #pad{display:block}}
 @media (pointer:coarse) and (min-width:600px),(hover:none) and (min-width:600px){:root{--padsz:min(20vmin,220px)}}
+.opad{display:none;position:absolute;bottom:2%;width:var(--opadsz,130px);height:var(--opadsz,130px);border-radius:50%;background:rgba(23,59,114,.3);border:3px solid rgba(255,255,255,.8);z-index:6}
+#opad1{left:2%} #opad2{right:2%}
+.opad i{position:absolute;font-style:normal;color:#fff;font-size:calc(var(--opadsz,130px)*.15);transform:translate(-50%,-50%);pointer-events:none}
+.oknob{position:absolute;left:50%;top:50%;width:36%;height:36%;margin:-18% 0 0 -18%;border-radius:50%;background:#fff;opacity:.9;pointer-events:none}
+.opadlbl{display:none;position:absolute;bottom:calc(2% + var(--opadsz,130px) + 4px);font-weight:bold;color:#fff;text-shadow:0 2px 4px #173B72;font-size:calc(var(--u)*2)}
+#opadlbl1{left:2%} #opadlbl2{right:2%}
+@media (pointer:coarse),(hover:none){:root{--opadsz:min(24vmin,140px)} .opad,.opadlbl{display:block}}
+@media (orientation:portrait){:root{--opadsz:min(28vw,140px)}}
 @media (orientation:portrait){#app{flex-direction:column;justify-content:flex-start;padding-top:1vh;gap:1.2vh}
   :root{--padsz:min(32vw,170px)}
   #stage{width:min(100vw,calc((100dvh - var(--padsz) - 6vh)*1000/720))}}
@@ -664,6 +672,10 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
     <canvas id="cv" width="1000" height="720"></canvas>
     <div id="ui"></div>
     <button id="leave" onclick="toMenu('')">&#10005;</button>
+    <div id="opadlbl1" class="opadlbl">P1</div>
+    <div id="opad1" class="opad"><i style="left:50%;top:12%">&#9650;</i><i style="left:50%;top:88%">&#9660;</i><i style="left:12%;top:50%">&#9664;</i><i style="left:88%;top:50%">&#9654;</i><div id="oknob1" class="oknob"></div></div>
+    <div id="opadlbl2" class="opadlbl">P2</div>
+    <div id="opad2" class="opad"><i style="left:50%;top:12%">&#9650;</i><i style="left:50%;top:88%">&#9660;</i><i style="left:12%;top:50%">&#9664;</i><i style="left:88%;top:50%">&#9654;</i><div id="oknob2" class="oknob"></div></div>
   </div>
   <div id="pad"><i style="left:50%;top:12%">&#9650;</i><i style="left:50%;top:88%">&#9660;</i><i style="left:12%;top:50%">&#9664;</i><i style="left:88%;top:50%">&#9654;</i><div id="knob"></div></div>
 </div>
@@ -671,6 +683,8 @@ input{font:inherit;font-size:calc(var(--u)*3);width:calc(var(--u)*15);text-align
 "use strict";
 const $=id=>document.getElementById(id);
 const cv=$('cv'), ui=$('ui'), stage=$('stage'), pad=$('pad'), knob=$('knob');
+const opad1=$('opad1'), oknob1=$('oknob1'), opadlbl1=$('opadlbl1');
+const opad2=$('opad2'), oknob2=$('oknob2'), opadlbl2=$('opadlbl2');
 let ctx=cv.getContext('2d');
 const FONT='"Arial Rounded MT Bold","Trebuchet MS",Verdana,sans-serif';
 const C={sky:'#8BDCF7',grass:'#78C968',grassL:'#82D072',grassD:'#55A84B',court:'#DDB77A',courtAlt:'#D5AD6E',line:'#FFF8E8',white:'#FFFFFF',black:'#292929',navy:'#173B72',blue:'#438FD1',blueD:'#2869A3',red:'#F05B5B',redD:'#C94444',yellow:'#FFD84D',orange:'#F4A340',skin:'#FFD0A6',hair:'#35251F'};
@@ -686,6 +700,7 @@ const LSTART_X=[440,560], LSTART_Y=CB-35, LSPD=250, LGSPD=280, LHGSPD=240, LHIT=
 let popups=[], lastSend=0, lastDx=9, lastDy=9, gotError=false, courtImg=null;
 let mv=[false,false], gmv=[false,false,false];
 const keys=new Set(), padState={left:false,right:false,up:false,down:false};
+const padState1={left:false,right:false,up:false,down:false}, padState2={left:false,right:false,up:false,down:false};
 
 /* ---------- drawing primitives ---------- */
 function ell(x,y,rx,ry,f,s,lw){ctx.beginPath();ctx.ellipse(x,y,Math.abs(rx),Math.abs(ry),0,0,6.2832);if(f){ctx.fillStyle=f;ctx.fill();}if(s){ctx.lineWidth=lw||2;ctx.strokeStyle=s;ctx.stroke();}}
@@ -969,11 +984,13 @@ function localPick(i){
   if(localSim.phase==='rps1'){localSim.rc[0]=i;localSim.phase='rps2';}
   else if(localSim.phase==='rps2'){localSim.rc[1]=i;localSim.phase='rpsshake';localSim.timer=1.6;}
 }
-function localDirP1(){const k=keys;return[((k.has('d')?1:0)-(k.has('a')?1:0)),((k.has('s')?1:0)-(k.has('w')?1:0))];}
-function localDirP2(){const k=keys;return[((k.has('arrowright')?1:0)-(k.has('arrowleft')?1:0)),((k.has('arrowdown')?1:0)-(k.has('arrowup')?1:0))];}
+function localDirP1(){const k=keys,p=padState1;return[(((k.has('d')||p.right)?1:0)-((k.has('a')||p.left)?1:0)),(((k.has('s')||p.down)?1:0)-((k.has('w')||p.up)?1:0))];}
+function localDirP2(){const k=keys,p=padState2;return[(((k.has('arrowright')||p.right)?1:0)-((k.has('arrowleft')||p.left)?1:0)),(((k.has('arrowdown')||p.down)?1:0)-((k.has('arrowup')||p.up)?1:0))];}
+function setOfflinePads(on){opad1.style.display=opad2.style.display=opadlbl1.style.display=opadlbl2.style.display=on?'':'none';}
 function startOffline(mode){
   if(ws){try{ws.close();}catch(e){}ws=null;}
   offline=true;me=-1;view='game';st=null;disp=null;popups=[];pad.style.display='none';
+  setOfflinePads(false);
   localSim=LocalRoom(mode);localSim.setupRound();
   if(mode==='versus'){localSim.rc=[null,null];localSim.rw=-1;localSim.phase='rps1';localSim.timer=0;}
   else{localSim.phase='ready';localSim.timer=LREADY;}
@@ -996,7 +1013,7 @@ function stepOffline(dt){
   mv=[dx1!==0||dy1!==0,dx2!==0||dy2!==0];
   gmv=[snap.g[0][2]===1,false,localSim.mode==='versus'?(localSim.players[1-localSim.runner].dx!==0):(snap.g[2][2]===1)];
   popups.forEach(x=>{x.y-=45*dt;x.life-=dt;});popups=popups.filter(x=>x.life>0);
-  if(prevPh!==snap.ph)phaseUI();
+  if(prevPh!==snap.ph){setOfflinePads(snap.ph==='ready'||snap.ph==='play');phaseUI();}
 }
 
 /* ---------- input ---------- */
@@ -1020,17 +1037,22 @@ addEventListener('keydown',e=>{
 addEventListener('keyup',e=>keys.delete(e.key.toLowerCase()));
 addEventListener('blur',()=>keys.clear());
 
-let padOn=false;
-function padUpdate(e){
-  const r=pad.getBoundingClientRect();
-  const x=Math.max(-1,Math.min(1,(e.clientX-r.left)/r.width*2-1)),y=Math.max(-1,Math.min(1,(e.clientY-r.top)/r.height*2-1));
-  padState.left=x<-.28;padState.right=x>.28;padState.up=y<-.28;padState.down=y>.28;
-  knob.style.transform='translate('+(x*45)+'%,'+(y*45)+'%)';
+function makePad(padEl,knobEl,state){
+  let on=false,pid=null;
+  function update(e){
+    const r=padEl.getBoundingClientRect();
+    const x=Math.max(-1,Math.min(1,(e.clientX-r.left)/r.width*2-1)),y=Math.max(-1,Math.min(1,(e.clientY-r.top)/r.height*2-1));
+    state.left=x<-.28;state.right=x>.28;state.up=y<-.28;state.down=y>.28;
+    knobEl.style.transform='translate('+(x*45)+'%,'+(y*45)+'%)';
+  }
+  function off(){on=false;pid=null;state.left=state.right=state.up=state.down=false;knobEl.style.transform='none';}
+  padEl.addEventListener('pointerdown',e=>{e.preventDefault();on=true;pid=e.pointerId;padEl.setPointerCapture(e.pointerId);update(e);});
+  padEl.addEventListener('pointermove',e=>{if(on&&e.pointerId===pid)update(e);});
+  ['pointerup','pointercancel'].forEach(ev=>padEl.addEventListener(ev,e=>{if(e.pointerId===pid)off();}));
 }
-function padOff(){padOn=false;padState.left=padState.right=padState.up=padState.down=false;knob.style.transform='none';}
-pad.addEventListener('pointerdown',e=>{e.preventDefault();padOn=true;pad.setPointerCapture(e.pointerId);padUpdate(e);});
-pad.addEventListener('pointermove',e=>{if(padOn)padUpdate(e);});
-['pointerup','pointercancel'].forEach(ev=>pad.addEventListener(ev,padOff));
+makePad(pad,knob,padState);            // online: the single joystick
+makePad(opad1,oknob1,padState1);       // offline: player 1's joystick (bottom-left)
+makePad(opad2,oknob2,padState2);       // offline: player 2's joystick (bottom-right)
 
 /* ---------- networking ---------- */
 function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -1098,6 +1120,7 @@ function applyStateOnline(m){
 function setUI(h){ui.innerHTML=h;ui.style.display=h?'flex':'none';}
 function menuUI(msg){
   pad.style.display='none';
+  opad1.style.display=opad2.style.display=opadlbl1.style.display=opadlbl2.style.display='none';
   const pre=(new URLSearchParams(location.search).get('room')||'').replace(/[^A-Za-z]/g,'').slice(0,4);
   setUI('<div class="card"><h1>PATINTERO</h1><div class="sub">Takbo \u2022 Iwas \u2022 Pumasa</div>'+
    '<div class="or">create a game</div>'+
@@ -1237,3 +1260,4 @@ if __name__ == "__main__":
         asyncio.run(main(chosen_port))
     except KeyboardInterrupt:
         print("\nStopped.")
+        
